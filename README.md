@@ -2,7 +2,7 @@
 
 A PyTorch research implementation that replaces dense linear projections (Q, K, V) in transformer attention with differentiable soft decision trees, trained end-to-end via backpropagation.
 
-**Key result:** Tree-augmented transformers beat standard transformers on character-level language modeling (+0.9pp accuracy) while approaching competitive speed through a series of architectural and computational optimizations.
+**Key result:** Tree-based attention provides a more expressive alternative to standard linear projections, with speed optimizations reducing overhead from 11x to ~3-5x. Current experiments show standard transformers slightly ahead on Shakespeare, but trees offer architectural flexibility for input-adaptive computation.
 
 ## Quick Start
 
@@ -12,11 +12,11 @@ pip install torch matplotlib  # matplotlib optional, for figures
 # Run the demo
 python main.py
 
-# Train on Shakespeare (fast config, ~5 min)
-python train.py --fast --model oblivious_boosted_vo_alt
+# Train on Shakespeare (full config, ~15 min)
+python train.py --model oblivious_boosted
 
 # Train all models for comparison
-python train.py --fast --model all
+python train.py --model all
 
 # Run synthetic benchmark
 python benchmark.py
@@ -24,15 +24,18 @@ python benchmark.py
 
 ## Results
 
-Shakespeare character-level LM (d_model=64, 2 layers, 2000 steps):
+Shakespeare character-level LM (d_model=128, 4 layers, 2000 steps):
 
-| Model | Val Acc | ms/step | vs Standard |
-|-------|---------|---------|-------------|
-| Standard Transformer | 28.8% | 20ms | 1.0x |
-| Obliv L+F (V+O, alternating) | **29.4%** | 50ms compiled | 2.7x |
-| Linear+MoE (alternating) | **29.7%** | 64ms compiled | 3.4x |
+| Model | Val Acc | ms/step | Params | vs Standard Speed |
+|-------|---------|---------|--------|-------------------|
+| Standard Transformer | **38.7%** | 57ms | 843K | 1.0x |
+| Linear+Forest | 38.3% | 545ms | 1.64M | 9.6x slower |
+| Oblivious L+F | 38.0% | 370ms | 1.44M | 6.5x slower |
+| Oblivious L+F (alternating) | 36.8% | 246ms | 1.14M | 4.3x slower |
+| Oblivious L+F (V+O, alt) | 36.4% | 171ms | 993K | 3.0x slower |
+| Linear+MoE (alternating) | 36.6% | 175ms | 1.06M | 3.1x slower |
 
-The best tree model exceeds standard accuracy by +0.9pp. Speed gap reduced from 11x to 2.7x through optimizations.
+Standard transformer remains most accurate, but optimizations reduced tree overhead from 11x to ~3-5x.
 
 ## Architecture
 
@@ -125,7 +128,7 @@ Standard transformers use dense linear projections: `Q = W_q @ x`. Tree-based at
 3. **Output**: Weighted sum of leaf output vectors, mixed across trees via input-dependent gating
 4. **LinearPlusForest**: A standard linear projection provides the base; the forest adds a nonlinear correction term
 
-The key insight is that soft routing makes forests compute **input-adaptive linear projections** -- a different effective weight matrix for every input, constructed as a weighted combination of leaf matrices. This is strictly more expressive than a single linear layer.
+The key insight is that soft routing makes forests compute **input-adaptive linear projections** -- a different effective weight matrix for every input, constructed as a weighted combination of leaf matrices. This is strictly more expressive than a single linear layer, though current results suggest standard transformers achieve better accuracy/efficiency balance on this task.
 
 ## File Structure
 
