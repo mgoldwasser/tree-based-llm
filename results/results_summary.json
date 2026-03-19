@@ -1,0 +1,50 @@
+{
+  "standard": {
+    "label": "Standard Transformer",
+    "final_val_acc": 0.386822509765625,
+    "final_val_loss": 2.0762665033340455,
+    "ms_per_step": 56.674379104049876,
+    "params": 842817,
+    "tree_pct": 0.0
+  },
+  "boosted": {
+    "label": "Linear+Forest",
+    "final_val_acc": 0.382745361328125,
+    "final_val_loss": 2.0865626096725465,
+    "ms_per_step": 545.138102562516,
+    "params": 1639633,
+    "tree_pct": 48.31617807155626
+  },
+  "oblivious_boosted": {
+    "label": "Oblivious L+F",
+    "final_val_acc": 0.38026123046875,
+    "final_val_loss": 2.097246789932251,
+    "ms_per_step": 370.4580351039767,
+    "params": 1439953,
+    "tree_pct": 41.149120839360734
+  },
+  "oblivious_boosted_alt": {
+    "label": "Oblivious L+F (alternating)",
+    "final_val_acc": 0.36766357421875,
+    "final_val_loss": 2.1406768918037415,
+    "ms_per_step": 246.03828058298677,
+    "params": 1141641,
+    "tree_pct": 25.95071480439122
+  },
+  "oblivious_boosted_vo_alt": {
+    "label": "Oblivious L+F (V+O, alt)",
+    "final_val_acc": 0.363690185546875,
+    "final_val_loss": 2.152586841583252,
+    "ms_per_step": 170.9635790414177,
+    "params": 992485,
+    "tree_pct": 14.925364111296394
+  },
+  "moe_boosted_alt": {
+    "label": "Linear+MoE (alternating)",
+    "final_val_acc": 0.366302490234375,
+    "final_val_loss": 2.1467684149742126,
+    "ms_per_step": 175.43702095851768,
+    "params": 1055145,
+    "tree_pct": 10.491069947732303
+  }
+}
