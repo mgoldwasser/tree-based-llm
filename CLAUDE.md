@@ -1,0 +1,131 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+A PyTorch research implementation of Tree-Based Attention for transformers. Replaces dense linear Q/K/V projections with differentiable soft decision trees, trained end-to-end via backpropagation. Two files: `main.py` (model) and `benchmark.py` (comparison vs standard attention).
+
+## Commands
+
+```bash
+# Install dependencies (only PyTorch required)
+pip install torch
+
+# Run the demo (trains a classification model on synthetic data)
+python main.py
+
+# Run the full benchmark (4 models × 2 tasks × 1000 steps, ~5-10 min on CPU)
+python benchmark.py
+
+# Train best speed/accuracy tree model (~49ms/step, 29.5% val acc)
+python train.py --fast --model boosted_alt
+
+# Train best accuracy tree model (~108ms/step, 29.8% val acc)
+python train.py --fast --model boosted
+
+# Train all models on Shakespeare (fast config)
+python train.py --fast --model all
+
+# Disable torch.compile if needed
+python train.py --fast --model boosted_alt --no-compile
+
+# Run compound optimization experiment
+python run_compound_experiment.py
+
+# Run speed/accuracy check on fast configs
+python run_speed_accuracy_check.py
+```
+
+There is no test suite, linter, or build system configured.
+
+## Architecture
+
+All model components live in `main.py`, layered bottom-up:
+
+1. **BatchedTreeForest** — Core primitive replacing `nn.Linear`. Stores ALL tree parameters in stacked tensors `(n_trees, n_internal, input_dim)` and computes all trees in a single batched einsum pass. Features: per-node learnable temperature (modulates global schedule), input-dependent tree gating via `gate_proj` (MoE-style, replaces fixed tree weights). Caches routing decisions and leaf probs for regularization losses.
+
+2. **ObliviousTreeForest** — NODE-style oblivious trees: all nodes at the same depth share one hyperplane. Decision weights: `(n_trees, depth, input_dim)` — fewer params than standard trees. Leaf probs computed via outer product (eliminates depth-dependent gradient vanishing). Same features as BatchedTreeForest (per-node temp, input-dependent gating).
+
+3. **LinearPlusForest / ObliviousLinearPlusForest** — Linear base projection + single wide forest for nonlinear correction: `output = base_linear(x) + shrinkage * forest(x)`. The linear base provides stable gradients and preserves residual stream structure; the forest adds input-adaptive nonlinear refinement.
+
+4. **`make_projection()` factory** — Creates `"linear"`, `"batched"`, `"boosted"`, `"oblivious"`, or `"oblivious_boosted"` projection layers. All higher-level components use this factory via `proj_type` parameter.
+
+5. **TreeAttention** — Multi-head attention with **separate** Q, K, V forests (unfused routing — each learns independent routing patterns). QK-norm (LayerNorm on Q and K after projection) stabilizes attention logits despite routing shifts during training. Output projection is also a tree forest.
+
+6. **TreeTransformerBlock** — Pre-norm transformer block with TreeAttention. Optional `use_tree_ffn` flag to also replace FFN linear layers with tree projections.
+
+7. **TreeTransformer** — Full model with embedding, positional encoding, stacked blocks, and a classification or language modeling head. `proj_type` parameter selects the projection type throughout.
+
+8. **Utilities**:
+   - `tree_regularization_loss()` — Entropy-based regularization with depth-decay weighting (2^-d). Positive lambda sharpens routing. Default: lambda=0.005.
+   - `leaf_balancing_loss()` — MoE-style load-balancing loss on leaf utilization. Penalizes leaf probability concentration: `L = alpha * n_leaves * mean(sum(p_l^2))`.
+   - `set_temperature()` / `get_routing_entropy()` — Temperature annealing and monitoring.
+   - `make_optimizer()` — Tree-aware param groups: decision weights + node temps at 3x LR with no weight decay; gate/leaf/other params at standard LR.
+   - `count_parameters()` — Reports total vs tree-specific parameter counts.
+
+## Design Decisions
+
+**Why this works with gradient descent:** The sigmoid routing at each tree node is the key. In a hard decision tree, you take a binary left/right path — that's non-differentiable. Here, every input "flows" through all paths simultaneously with soft probabilities, so the gradient is well-defined everywhere.
+
+**Soft routing is the feature, not a compromise:** With soft routing, the forest computes an input-adaptive linear projection — a different effective W for every input, constructed as a weighted combination of leaf matrices. This is strictly more expressive than a single linear layer. Hard routing (entropy collapse) reduces trees to piecewise-constant lookup tables with 8x fewer effective parameters. Temperature annealing should be conservative (floor ~0.7) to preserve this advantage.
+
+**Oblivious trees (NODE-style):** All nodes at the same depth share one hyperplane split. Leaf probs are computed as outer products of per-depth choices, eliminating the multiplicative gradient chain through sigmoid derivatives. Each depth level gets independent gradients. Fewer parameters: `(n_trees, depth, input_dim)` vs `(n_trees, 2^depth-1, input_dim)`.
+
+**Unfused QKV routing:** Q ("what am I looking for?"), K ("what do I contain?"), and V (content) are fundamentally different functions. Shared routing forces identical tree paths for all three, limiting expressiveness. Separate forests allow each to specialize. The Linear+Forest gap (27.6% vs 26.7% batched) was partly explained by fused routing.
+
+**QK-norm:** Tree projections have unpredictable output scale during training (routing shifts change which leaves dominate). LayerNorm on Q and K after projection stabilizes attention logit magnitudes, following Gemma 2 / ViT-22B practice.
+
+**Input-dependent tree gating:** Replaces fixed `softmax(tree_weights)` with `softmax(gate_proj(x))`. Each token routes to different tree mixtures, analogous to MoE expert gating. Trees already provide input-dependence through internal routing; gating adds tree-level specialization.
+
+**Per-node learnable temperature:** Each internal node learns its own temperature factor via `softplus(logit + 0.5413)` (initializes to 1.0). Root might want soft routing (explore both subtrees) while leaf-adjacent nodes want sharp (crisp final selection). Modulates the global temperature schedule.
+
+**Leaf balancing loss (MoE analog):** `L = alpha * n_leaves * mean(sum(mean_prob_l^2))`. Prevents routing collapse where 1-2 leaves get all mass. Uniform leaves: loss = alpha * 1.0. Collapsed to 1 leaf: loss = alpha * n_leaves.
+
+**Init std = 0.1 (up from 0.02):** With d_model=64, routing logits have std ~0.8, sigmoid range [0.31, 0.69]. Trees differentiate routing from step 1 instead of spending hundreds of steps learning to differentiate.
+
+**Temperature annealing:** Controls the sharpness of routing decisions. Held at 1.0 (fully soft) for the first 50% of training, then cosine annealed from 1.0 → 0.7 over the second half. Use `set_temperature(model, t)` in the training loop.
+
+**LR warmup + cosine decay:** 100-step linear warmup stabilizes Adam's variance estimates (critical with 3x LR multiplier for decision params). Cosine decay to 10% of peak lets the model settle into sharper minima. Applied via LambdaLR scheduler in train.py.
+
+**Dropout = 0.0:** Model is underfitting (train/val gap ≈ 0), so dropout is pure noise. Removed by default.
+
+**Entropy regularization:** Default lambda=0.005 (mild sharpening pressure). Uses depth-decay weighting (2^-d) so deeper nodes aren't over-regularized.
+
+**Batched computation:** All trees in a forest are computed via a single `einsum('bsd,tnd->bstn', x, decision_weights)` — no Python loop. Oblivious trees further reduce this to `(n_trees, depth, input_dim)`.
+
+**LinearPlusForest:** Linear base preserves residual stream structure; forest adds nonlinear correction. This explains the boosted-vs-batched accuracy gap.
+
+**Practical tradeoffs:** Parameter count scales as `O(n_trees × 2^depth × (input_dim + output_dim))` for standard trees, `O(n_trees × (depth × input_dim + 2^depth × output_dim))` for oblivious. Recommended configs: depth 3 with 12 trees per forest for batched/oblivious, or 24 trees × depth 3 for boosted.
+
+## Key Hyperparameters
+
+- `proj_type`: `"batched"`, `"boosted"`, `"oblivious"`, or `"oblivious_boosted"`
+- `n_trees`: Trees per forest for batched/oblivious (default: 12)
+- `boosted_trees`: Trees in LinearPlusForest (default: 24)
+- `tree_depth` / `boosted_depth`: Tree depth (default: 3)
+- `temperature`: Routing softness — held at 1.0 for first 50%, then annealed 1.0 → 0.7
+- `use_tree_ffn`: Whether FFN layers also use tree projections (default: True)
+- `dropout`: Default 0.0 (model underfits)
+- Entropy reg lambda: 0.005 (mild sharpening)
+- Leaf balance alpha: 0.01
+
+## Benchmark
+
+`benchmark.py` compares 4 models on 2 synthetic tasks:
+
+**Models:** Standard Transformer, Batched Forest (attn), Boosted Forest (attn), Boosted Forest (full)
+
+**Tasks:**
+- Linear: `next = (prev + offset) % vocab` — favors linear models
+- Non-linear: `next = lookup_table[prev XOR prev_prev]` — tests non-linear capacity
+
+**Metrics:** Next-token accuracy (primary), loss, routing entropy
+
+## Train
+
+`train.py` compares 5 models on Shakespeare character-level LM:
+
+**Models:** Standard Transformer, Batched Forest, Linear+Forest, Oblivious Forest, Oblivious Linear+Forest
+
+**Training:** LR warmup (100 steps) + cosine decay to 10%. Temperature annealing (1.0 → 0.7 cosine). Entropy reg (lambda=0.005) + leaf balancing (alpha=0.01).
