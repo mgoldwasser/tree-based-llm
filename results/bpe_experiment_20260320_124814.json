@@ -1,0 +1,74 @@
+{
+  "standard_char": {
+    "name": "standard/char",
+    "params": 116673,
+    "final_val_acc": 0.2900634765625,
+    "final_val_loss": 2.4305821537971495,
+    "final_train_acc": 0.2911376953125,
+    "final_train_loss": 2.427483880519867,
+    "time": 15.156718957936391,
+    "ms_per_step": 7.578359478968196,
+    "tokenization": "char",
+    "vocab_size": 65
+  },
+  "oblivious_boosted_alt_char": {
+    "name": "oblivious_boosted_alt/char",
+    "params": 191717,
+    "final_val_acc": 0.3027099609375,
+    "final_val_loss": 2.393732011318207,
+    "final_train_acc": 0.30322265625,
+    "final_train_loss": 2.3942217588424684,
+    "time": 466.1006490418222,
+    "ms_per_step": 233.0503245209111,
+    "tokenization": "char",
+    "vocab_size": 65
+  },
+  "micro_boosted_char": {
+    "name": "micro_boosted/char",
+    "params": 138921,
+    "final_val_acc": 0.29415283203125,
+    "final_val_loss": 2.405374085903168,
+    "final_train_acc": 0.3004150390625,
+    "final_train_loss": 2.3849178552627563,
+    "time": 73.24310066713952,
+    "ms_per_step": 36.62155033356976,
+    "tokenization": "char",
+    "vocab_size": 65
+  },
+  "standard_bpe500": {
+    "name": "standard/bpe500",
+    "params": 172788,
+    "final_val_acc": 0.06937255859375,
+    "final_val_loss": 4.533627653121949,
+    "final_train_acc": 0.09288330078125,
+    "final_train_loss": 4.3606980562210085,
+    "time": 19.1735829168465,
+    "ms_per_step": 9.58679145842325,
+    "tokenization": "bpe",
+    "vocab_size": 500
+  },
+  "oblivious_boosted_alt_bpe500": {
+    "name": "oblivious_boosted_alt/bpe500",
+    "params": 247832,
+    "final_val_acc": 0.0658203125,
+    "final_val_loss": 4.601000380516052,
+    "final_train_acc": 0.087109375,
+    "final_train_loss": 4.4133717775344845,
+    "time": 470.4178603331093,
+    "ms_per_step": 235.20893016655464,
+    "tokenization": "bpe",
+    "vocab_size": 500
+  },
+  "micro_boosted_bpe500": {
+    "name": "micro_boosted/bpe500",
+    "params": 195036,
+    "final_val_acc": 0.0677001953125,
+    "final_val_loss": 4.598412585258484,
+    "final_train_acc": 0.0877685546875,
+    "final_train_loss": 4.436209559440613,
+    "time": 82.39143991703168,
+    "ms_per_step": 41.19571995851584,
+    "tokenization": "bpe",
+    "vocab_size": 500
+  }
+}

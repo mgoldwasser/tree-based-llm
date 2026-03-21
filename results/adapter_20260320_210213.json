@@ -1,0 +1,36 @@
+{
+  "standard_full": {
+    "val_acc": 0.2900634765625,
+    "val_loss": 2.4305811643600466,
+    "train_acc": 0.2911376953125,
+    "train_loss": 2.427482879161835,
+    "time": 13.101462125079706,
+    "ms_per_step": 6.550731062539853,
+    "params": 116673,
+    "name": "Standard Transformer"
+  },
+  "micro_tree_scratch": {
+    "val_acc": 0.29493408203125,
+    "val_loss": 2.40393648147583,
+    "train_acc": 0.30064697265625,
+    "train_loss": 2.383392667770386,
+    "time": 112.83818141696975,
+    "ms_per_step": 56.41909070848487,
+    "params": 138921,
+    "name": "Linear+MicroTree (from scratch)"
+  },
+  "tree_adapter": {
+    "val_acc": 0.2602783203125,
+    "val_loss": 2.5820624232292175,
+    "train_acc": 0.2662109375,
+    "train_loss": 2.56364027261734,
+    "time": 169.57366529200226,
+    "ms_per_step": 254.61511305105444,
+    "params": 138921,
+    "trainable_params": 21096,
+    "pretrain_steps": 1333,
+    "finetune_steps": 666,
+    "pretrain_val_acc": 0.27662353515625,
+    "name": "Tree Adapter (pretrain+finetune)"
+  }
+}

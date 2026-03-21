@@ -35,6 +35,22 @@ python run_compound_experiment.py
 
 # Run speed/accuracy check on fast configs
 python run_speed_accuracy_check.py
+
+# Phase A experiments (core question: can trees win at matched params?)
+python run_matched_params.py          # NEW-02: Matched-parameter comparison
+python run_depth_ablation.py          # NEW-06: Depth ablation study
+python run_micro_tree.py              # NEW-01: Micro-tree experiment
+
+# Phase B experiments (fundamental improvements)
+python run_contextual_routing.py      # NEW-05: Context-aware routing
+python run_bpe_experiment.py          # NEW-08: BPE vs char-level tokenization
+python run_scaling_grid.py            # NEW-07: Scaling study (where trees win)
+
+# Phase C experiments (practical deployment)
+python run_hard_routing.py            # NEW-03: Hard routing at inference
+python run_adapters.py                # NEW-04: Trees-as-adapters
+
+# All experiment scripts support: --full (full config), --no-compile
 ```
 
 There is no test suite, linter, or build system configured.
@@ -49,7 +65,20 @@ All model components live in `main.py`, layered bottom-up:
 
 3. **LinearPlusForest / ObliviousLinearPlusForest** — Linear base projection + single wide forest for nonlinear correction: `output = base_linear(x) + shrinkage * forest(x)`. The linear base provides stable gradients and preserves residual stream structure; the forest adds input-adaptive nonlinear refinement.
 
-4. **`make_projection()` factory** — Creates `"linear"`, `"batched"`, `"boosted"`, `"oblivious"`, or `"oblivious_boosted"` projection layers. All higher-level components use this factory via `proj_type` parameter.
+3b. **MicroTreeForest** — Minimal-overhead trees: depth 1-2, few trees (2-8), with low-rank leaf factorization (`leaf_down @ leaf_up`, rank << output_dim). Designed for <10% param overhead over nn.Linear. Uses oblivious-style routing. **LinearPlusMicroTree** combines a linear base with micro-tree correction.
+
+3c. **ContextualRoutingForest** — Oblivious forest with context-aware routing: `routing_input = x + context_proj(ema_context)` where EMA context captures recent hidden state history. Addresses limitation that standard trees route on single tokens without context. **LinearPlusContextual** adds a linear base.
+
+3d. **Speed-optimized projections** — Alternative approaches to input-dependent computation with lower overhead than trees:
+   - **GatedProjection** — GLU-style: `W(x) * σ(V(x))`. Equivalent to depth-1 tree as parallel matmuls. Stack multiple gates for more "depth".
+   - **DynamicLinear** — Base + per-token low-rank modulation: `W(x) + shrinkage * (x @ W_down) @ W_up`. What trees reduce to without routing. ~1.3x overhead.
+   - **LowRankRoutingForest** — Oblivious forest with low-rank routing projection (r=16 vs d=128). Reduces routing einsum cost by d/r factor.
+   - **RecursiveProjection** — Apply `gate * W_L(h) + (1-gate) * W_R(h)` K times, reusing parameters. Depth-K nonlinearity with depth-1 param count.
+   - **ChunkedRoutingForest** — Share routing decisions across token chunks. Routes on chunk means, broadcasts to all tokens in chunk.
+   - **ProductKeyProjection** — Hash-based leaf selection via split codebooks. O(sqrt(n_leaves)) routing cost.
+   All have `LinearPlus*` variants (linear base + correction).
+
+4. **`make_projection()` factory** — Creates projection layers by type string. Supports: `"linear"`, `"batched"`, `"boosted"`, `"oblivious"`, `"oblivious_boosted"`, `"micro_tree"`, `"micro_boosted"`, `"contextual"`, `"contextual_boosted"`, `"gated"`, `"gated_boosted"`, `"dynamic"`, `"dynamic_boosted"`, `"lowrank_routing"`, `"lowrank_boosted"`, `"recursive"`, `"recursive_boosted"`, `"chunked"`, `"chunked_boosted"`, `"product_key"`, `"product_key_boosted"`. All higher-level components use this factory via `proj_type` parameter.
 
 5. **TreeAttention** — Multi-head attention with **separate** Q, K, V forests (unfused routing — each learns independent routing patterns). QK-norm (LayerNorm on Q and K after projection) stabilizes attention logits despite routing shifts during training. Output projection is also a tree forest.
 
@@ -63,6 +92,8 @@ All model components live in `main.py`, layered bottom-up:
    - `set_temperature()` / `get_routing_entropy()` — Temperature annealing and monitoring.
    - `make_optimizer()` — Tree-aware param groups: decision weights + node temps at 3x LR with no weight decay; gate/leaf/other params at standard LR.
    - `count_parameters()` — Reports total vs tree-specific parameter counts.
+   - `freeze_non_tree_params()` / `unfreeze_all_params()` — For adapter-style fine-tuning: freeze everything except tree parameters.
+   - `set_hard_routing(model, enabled, top_k)` — Toggle hard routing (top-k leaf selection) on all tree modules. For inference-time sparsification.
 
 ## Design Decisions
 
@@ -98,11 +129,21 @@ All model components live in `main.py`, layered bottom-up:
 
 **Practical tradeoffs:** Parameter count scales as `O(n_trees × 2^depth × (input_dim + output_dim))` for standard trees, `O(n_trees × (depth × input_dim + 2^depth × output_dim))` for oblivious. Recommended configs: depth 3 with 12 trees per forest for batched/oblivious, or 24 trees × depth 3 for boosted.
 
+**Micro-trees (low-rank leaves):** Replace full leaf matrices `(n_leaves, output_dim)` with factored `leaf_down @ leaf_up` where `leaf_down: (n_leaves, rank)` and `leaf_up: (rank, output_dim)`. With depth=1, 4 trees, rank=8: ~10% param overhead over nn.Linear at d_model=128. The key insight: very shallow, very few trees can be parameter-efficient — the routing overhead drops from ~45% to ~10% of params.
+
+**Contextual routing:** Standard trees route on the raw token embedding — "bank" routes identically in "river bank" vs "bank account". Contextual routing uses EMA of recent hidden states: `routing_input = x + context_proj(ema_context)`. Vectorized via power-series cumsum (no Python loop, torch.compile compatible).
+
+**Hard routing at inference:** Train with full soft routing (all leaves get gradients), evaluate with top-k hard routing (only k leaves contribute). At depth 3, top-2 hard routing eliminates 75% of leaf computation. Key for making trees practical.
+
+**Trees-as-adapters:** Pretrain a standard transformer (fast), freeze linear weights, add micro-tree corrections. Trees learn the *residual* — what linear projections miss. Much smaller trees suffice. This is LoRA with learned input-dependent routing instead of fixed low-rank decomposition.
+
 ## Key Hyperparameters
 
-- `proj_type`: `"batched"`, `"boosted"`, `"oblivious"`, or `"oblivious_boosted"`
-- `n_trees`: Trees per forest for batched/oblivious (default: 12)
+- `proj_type`: `"batched"`, `"boosted"`, `"oblivious"`, `"oblivious_boosted"`, `"micro_tree"`, `"micro_boosted"`, `"contextual"`, `"contextual_boosted"`
+- `n_trees`: Trees per forest for batched/oblivious (default: 12), micro-tree (default: 4)
 - `boosted_trees`: Trees in LinearPlusForest (default: 24)
+- `leaf_rank`: Low-rank leaf factorization rank for MicroTreeForest (default: 8)
+- `ema_decay`: EMA decay for contextual routing (default: 0.9)
 - `tree_depth` / `boosted_depth`: Tree depth (default: 3)
 - `temperature`: Routing softness — held at 1.0 for first 50%, then annealed 1.0 → 0.7
 - `use_tree_ffn`: Whether FFN layers also use tree projections (default: True)

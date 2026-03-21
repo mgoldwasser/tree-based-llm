@@ -119,6 +119,8 @@ class BatchedTreeForest(nn.Module):
 
         self._cached_decisions = None
         self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         squeeze = False
@@ -137,6 +139,13 @@ class BatchedTreeForest(nn.Module):
 
         # Leaf probabilities in log-space: (B, S, T, n_leaves)
         leaf_probs = self._compute_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
         self._cached_leaf_probs = leaf_probs
 
         # Per-tree output → input-dependent weighted mixture: (B, S, output_dim)
@@ -198,6 +207,8 @@ class ObliviousTreeForest(nn.Module):
 
         self._cached_decisions = None
         self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         squeeze = False
@@ -213,6 +224,212 @@ class ObliviousTreeForest(nn.Module):
         self._cached_decisions = decisions
 
         leaf_probs = _compute_oblivious_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        self._cached_leaf_probs = leaf_probs
+
+        per_tree = torch.einsum('bstl,tlo->bsto', leaf_probs, self.leaf_outputs)
+        weights = F.softmax(self.gate_proj(x), dim=-1)
+        output = torch.einsum('bsto,bst->bso', per_tree, weights)
+
+        if squeeze:
+            output = output.squeeze(1)
+        return self.norm(output)
+
+
+# =============================================================================
+# 1c. MICRO TREE FOREST (depth 1-2, low-rank leaf factorization)
+# =============================================================================
+
+class MicroTreeForest(nn.Module):
+    """
+    Minimal-overhead tree forest: depth 1-2, few trees, low-rank leaf outputs.
+    Designed for <5% parameter overhead over nn.Linear.
+
+    Uses oblivious-style routing (one hyperplane per depth level).
+    Low-rank factorization: leaf_output = leaf_down @ leaf_up (rank << output_dim).
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 4,
+                 tree_depth: int = 1, leaf_rank: int = 8, temperature: float = 1.0,
+                 use_norm: bool = True):
+        super().__init__()
+        self.n_trees = n_trees
+        self.depth = tree_depth
+        self.n_leaves = 2 ** tree_depth
+        self.leaf_rank = leaf_rank
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        # One hyperplane per depth level (oblivious-style)
+        self.decision_weights = nn.Parameter(torch.empty(n_trees, tree_depth, input_dim))
+        self.decision_biases = nn.Parameter(torch.zeros(n_trees, tree_depth))
+
+        # Low-rank leaf factorization: leaf_output = leaf_down @ leaf_up
+        self.leaf_down = nn.Parameter(torch.empty(n_trees, self.n_leaves, leaf_rank))
+        self.leaf_up = nn.Parameter(torch.empty(n_trees, leaf_rank, output_dim))
+
+        # Input-dependent tree gating
+        self.gate_proj = nn.Linear(input_dim, n_trees)
+
+        # Per-depth learnable temperature factors
+        self.node_temperature_logits = nn.Parameter(torch.zeros(n_trees, tree_depth))
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        # Init
+        nn.init.normal_(self.decision_weights, 0, 0.1)
+        nn.init.xavier_normal_(self.leaf_down.view(-1, self.n_leaves, leaf_rank)[0].unsqueeze(0).squeeze(0))
+        for t in range(n_trees):
+            nn.init.xavier_normal_(self.leaf_down[t])
+            nn.init.xavier_normal_(self.leaf_up[t])
+
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+
+        # Oblivious routing: (B, S, T, depth)
+        decisions = torch.einsum('bsd,tnd->bstn', x, self.decision_weights)
+        decisions = decisions + self.decision_biases
+
+        node_temps = self.temperature * F.softplus(self.node_temperature_logits + 0.5413)
+        decisions = torch.sigmoid(decisions / node_temps)
+        self._cached_decisions = decisions
+
+        # Leaf probs via outer product
+        leaf_probs = _compute_oblivious_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        self._cached_leaf_probs = leaf_probs
+
+        # Low-rank leaf outputs: (n_trees, n_leaves, output_dim)
+        leaf_outputs = torch.bmm(self.leaf_down, self.leaf_up)  # (T, L, O)
+
+        # Per-tree output → gated mixture
+        per_tree = torch.einsum('bstl,tlo->bsto', leaf_probs, leaf_outputs)
+        weights = F.softmax(self.gate_proj(x), dim=-1)  # (B, S, n_trees)
+        output = torch.einsum('bsto,bst->bso', per_tree, weights)
+
+        if squeeze:
+            output = output.squeeze(1)
+        return self.norm(output)
+
+
+# =============================================================================
+# 1d. CONTEXTUAL ROUTING FOREST (context-aware routing via EMA)
+# =============================================================================
+
+class ContextualRoutingForest(nn.Module):
+    """
+    Oblivious forest with context-aware routing.
+    routing_input = x + context_proj(ema_context)
+    where ema_context is exponential moving average of recent hidden states.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 12,
+                 tree_depth: int = 3, temperature: float = 1.0,
+                 context_dim: int = None, ema_decay: float = 0.9,
+                 use_norm: bool = True):
+        super().__init__()
+        self.n_trees = n_trees
+        self.depth = tree_depth
+        self.n_leaves = 2 ** tree_depth
+        self.ema_decay = ema_decay
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        # Context projection: maps EMA context to routing space
+        self.context_proj = nn.Linear(input_dim, input_dim)
+
+        # One hyperplane per depth level (oblivious-style)
+        self.decision_weights = nn.Parameter(torch.empty(n_trees, tree_depth, input_dim))
+        self.decision_biases = nn.Parameter(torch.zeros(n_trees, tree_depth))
+        self.leaf_outputs = nn.Parameter(torch.empty(n_trees, self.n_leaves, output_dim))
+
+        # Input-dependent tree gating
+        self.gate_proj = nn.Linear(input_dim, n_trees)
+
+        # Per-depth learnable temperature factors
+        self.node_temperature_logits = nn.Parameter(torch.zeros(n_trees, tree_depth))
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        _init_forest_params(self.decision_weights, self.leaf_outputs)
+
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
+
+    def _compute_ema_context(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute causal EMA context along sequence dimension (vectorized)."""
+        B, S, D = x.shape
+        decay = self.ema_decay
+
+        # Vectorized EMA via power series:
+        # ema[t] = (1-d) * sum_{k=0}^{t-1} d^k * x[t-1-k]
+        # Shift x by 1 (first position gets zeros context)
+        x_shifted = torch.cat([torch.zeros(B, 1, D, device=x.device, dtype=x.dtype),
+                                x[:, :-1]], dim=1)
+
+        # Compute decay powers: d^0, d^1, ..., d^{S-1}
+        powers = decay ** torch.arange(S, device=x.device, dtype=x.dtype)  # (S,)
+
+        # Scale shifted input by decay powers (reversed for convolution)
+        # x_scaled[t] = d^t * x_shifted[t]
+        x_scaled = x_shifted * powers.unsqueeze(0).unsqueeze(-1)  # (B, S, D)
+
+        # Cumulative sum gives sum_{k=0}^{t} d^k * x_shifted[k]
+        cumsum = torch.cumsum(x_scaled, dim=1)  # (B, S, D)
+
+        # Undo the scaling: ema[t] = (1-d) * cumsum[t] / d^t
+        # But d^t can be very small for large t, so use: cumsum[t] / d^t
+        inv_powers = (1.0 / (powers + 1e-8)).unsqueeze(0).unsqueeze(-1)  # (1, S, 1)
+        ema_context = (1 - decay) * cumsum * inv_powers
+
+        return ema_context
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+
+        # Compute context-aware routing input
+        ema_context = self._compute_ema_context(x)
+        routing_input = x + self.context_proj(ema_context)
+
+        # Oblivious routing on context-enhanced input: (B, S, T, depth)
+        decisions = torch.einsum('bsd,tnd->bstn', routing_input, self.decision_weights)
+        decisions = decisions + self.decision_biases
+
+        node_temps = self.temperature * F.softplus(self.node_temperature_logits + 0.5413)
+        decisions = torch.sigmoid(decisions / node_temps)
+        self._cached_decisions = decisions
+
+        leaf_probs = _compute_oblivious_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
         self._cached_leaf_probs = leaf_probs
 
         per_tree = torch.einsum('bstl,tlo->bsto', leaf_probs, self.leaf_outputs)
@@ -261,6 +478,497 @@ class ObliviousLinearPlusForest(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.base_proj(x) + self.shrinkage * self.forest(x))
+
+
+class LinearPlusMicroTree(nn.Module):
+    """Linear base + micro tree correction. Low-rank factorized leaves for minimal overhead."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 4,
+                 tree_depth: int = 1, leaf_rank: int = 8, temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.forest = MicroTreeForest(input_dim, output_dim, n_trees, tree_depth,
+                                       leaf_rank, temperature, use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.forest(x))
+
+
+class LinearPlusContextual(nn.Module):
+    """Linear base + contextual routing forest correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 24,
+                 tree_depth: int = 3, temperature: float = 1.0,
+                 ema_decay: float = 0.9):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.forest = ContextualRoutingForest(input_dim, output_dim, n_trees,
+                                               tree_depth, temperature,
+                                               ema_decay=ema_decay, use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.forest(x))
+
+
+# =============================================================================
+# 2e. SPEED-OPTIMIZED PROJECTIONS
+# =============================================================================
+
+class GatedProjection(nn.Module):
+    """
+    GLU-style gated projection: output = W(x) * sigmoid(V(x))
+
+    Equivalent to a depth-1 tree with 2 leaves but implemented as
+    parallel matmuls — no routing infrastructure needed.
+    Can stack multiple gates for more "depth".
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_gates: int = 1,
+                 temperature: float = 1.0, use_norm: bool = True):
+        super().__init__()
+        self.n_gates = n_gates
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        self.W = nn.Linear(input_dim, output_dim)
+        # One gate projection per "depth level"
+        self.gates = nn.ModuleList([
+            nn.Linear(input_dim, output_dim) for _ in range(n_gates)
+        ])
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        # For compatibility with tree utilities
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.depth = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.W(x)
+        for gate in self.gates:
+            output = output * torch.sigmoid(gate(x) / self.temperature)
+        return self.norm(output)
+
+
+class LinearPlusGated(nn.Module):
+    """Linear base + gated correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_gates: int = 1,
+                 temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.gated = GatedProjection(input_dim, output_dim, n_gates,
+                                      temperature, use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.gated(x))
+
+
+class DynamicLinear(nn.Module):
+    """
+    Dynamic linear projection: base + per-token low-rank correction.
+    output = W(x) + shrinkage * (x @ W_down) @ W_up
+
+    Each token gets a different effective projection matrix.
+    This is what trees reduce to once you strip away routing infrastructure.
+    Cost: 2 matmuls (vs 4+ for trees).
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, rank: int = 8,
+                 n_modulations: int = 1, temperature: float = 1.0,
+                 use_norm: bool = True):
+        super().__init__()
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        self.base = nn.Linear(input_dim, output_dim)
+        # Multiple modulation heads for more expressiveness
+        self.n_modulations = n_modulations
+        self.down_projs = nn.ModuleList([
+            nn.Linear(input_dim, rank, bias=False) for _ in range(n_modulations)
+        ])
+        self.up_projs = nn.ParameterList([
+            nn.Parameter(torch.randn(rank, output_dim) * 0.01) for _ in range(n_modulations)
+        ])
+
+        if n_modulations > 1:
+            self.mod_gate = nn.Linear(input_dim, n_modulations)
+
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        # For compatibility with tree utilities
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.depth = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+
+        if self.n_modulations == 1:
+            modulation = self.down_projs[0](x) @ self.up_projs[0]
+        else:
+            # Gated mixture of modulations
+            gate = F.softmax(self.mod_gate(x) / self.temperature, dim=-1)  # (B, S, n_mod)
+            modulation = torch.zeros_like(base_out)
+            for i in range(self.n_modulations):
+                mod_i = self.down_projs[i](x) @ self.up_projs[i]  # (B, S, output_dim)
+                modulation = modulation + gate[..., i:i+1] * mod_i
+
+        return self.norm(base_out + self.shrinkage * modulation)
+
+
+class LowRankRoutingForest(nn.Module):
+    """
+    Oblivious forest with low-rank routing projection.
+    Projects input to a small routing space (r << d_model) before computing
+    tree decisions. Reduces routing einsum cost by d_model/r factor.
+
+    routing: x @ W_down (B,S,d -> B,S,r), then einsum with (T, depth, r)
+    leaves: full-rank (T, n_leaves, output_dim) as usual
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 12,
+                 tree_depth: int = 3, routing_rank: int = 16,
+                 temperature: float = 1.0, use_norm: bool = True):
+        super().__init__()
+        self.n_trees = n_trees
+        self.depth = tree_depth
+        self.n_leaves = 2 ** tree_depth
+        self.routing_rank = routing_rank
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        # Low-rank routing: project input to routing_rank dims first
+        self.route_down = nn.Linear(input_dim, routing_rank, bias=False)
+        self.decision_weights = nn.Parameter(torch.empty(n_trees, tree_depth, routing_rank))
+        self.decision_biases = nn.Parameter(torch.zeros(n_trees, tree_depth))
+        self.leaf_outputs = nn.Parameter(torch.empty(n_trees, self.n_leaves, output_dim))
+
+        # Input-dependent tree gating
+        self.gate_proj = nn.Linear(input_dim, n_trees)
+
+        # Per-depth learnable temperature factors
+        self.node_temperature_logits = nn.Parameter(torch.zeros(n_trees, tree_depth))
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        nn.init.normal_(self.decision_weights, 0, 0.1)
+        _init_forest_params(self.decision_weights, self.leaf_outputs)
+
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+
+        # Low-rank routing: project input to small routing space
+        x_route = self.route_down(x)  # (B, S, routing_rank)
+
+        # Oblivious routing in low-rank space: (B, S, T, depth)
+        decisions = torch.einsum('bsr,tnr->bstn', x_route, self.decision_weights)
+        decisions = decisions + self.decision_biases
+
+        node_temps = self.temperature * F.softplus(self.node_temperature_logits + 0.5413)
+        decisions = torch.sigmoid(decisions / node_temps)
+        self._cached_decisions = decisions
+
+        # Leaf probs via outer product
+        leaf_probs = _compute_oblivious_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        self._cached_leaf_probs = leaf_probs
+
+        per_tree = torch.einsum('bstl,tlo->bsto', leaf_probs, self.leaf_outputs)
+        weights = F.softmax(self.gate_proj(x), dim=-1)
+        output = torch.einsum('bsto,bst->bso', per_tree, weights)
+
+        if squeeze:
+            output = output.squeeze(1)
+        return self.norm(output)
+
+
+class LinearPlusLowRankRouting(nn.Module):
+    """Linear base + low-rank routing forest correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 24,
+                 tree_depth: int = 3, routing_rank: int = 16,
+                 temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.forest = LowRankRoutingForest(input_dim, output_dim, n_trees,
+                                            tree_depth, routing_rank, temperature,
+                                            use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.forest(x))
+
+
+class RecursiveProjection(nn.Module):
+    """
+    Recursive gated projection: apply gate * W_L(h) + (1-gate) * W_R(h)
+    K times in sequence, reusing the same parameters.
+
+    Gets depth-K nonlinearity with depth-1 parameter count.
+    Each iteration is like one level of tree depth.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_iterations: int = 3,
+                 temperature: float = 1.0, use_norm: bool = True):
+        super().__init__()
+        self.n_iterations = n_iterations
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        # Shared across iterations (parameter reuse)
+        self.gate_proj = nn.Linear(input_dim, output_dim)
+        self.W_left = nn.Linear(input_dim, output_dim, bias=False)
+        self.W_right = nn.Linear(input_dim, output_dim, bias=False)
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        # For compatibility
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.depth = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = torch.sigmoid(self.gate_proj(x) / self.temperature)
+        left = self.W_left(x)
+        right = self.W_right(x)
+
+        h = gate * left + (1 - gate) * right
+        for _ in range(self.n_iterations - 1):
+            # Recompute gate based on evolving h but with original x dimensions
+            # Use h as the gating signal for subsequent iterations
+            gate = torch.sigmoid(self.gate_proj(x) / self.temperature * (1 + 0.1 * h.detach().norm(dim=-1, keepdim=True) / (h.shape[-1] ** 0.5)))
+            h = gate * left + (1 - gate) * right
+
+        return self.norm(h)
+
+
+class LinearPlusRecursive(nn.Module):
+    """Linear base + recursive gated correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_iterations: int = 3,
+                 temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.recursive = RecursiveProjection(input_dim, output_dim, n_iterations,
+                                              temperature, use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.recursive(x))
+
+
+class ChunkedRoutingForest(nn.Module):
+    """
+    Oblivious forest with chunked/amortized routing.
+    Groups tokens into chunks, routes based on chunk means,
+    then broadcasts routing decisions to all tokens in the chunk.
+
+    Reduces routing cost by chunk_size factor.
+    Leaf outputs are still computed per-token (gating is per-token).
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 12,
+                 tree_depth: int = 3, chunk_size: int = 16,
+                 temperature: float = 1.0, use_norm: bool = True):
+        super().__init__()
+        self.n_trees = n_trees
+        self.depth = tree_depth
+        self.n_leaves = 2 ** tree_depth
+        self.chunk_size = chunk_size
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        self.decision_weights = nn.Parameter(torch.empty(n_trees, tree_depth, input_dim))
+        self.decision_biases = nn.Parameter(torch.zeros(n_trees, tree_depth))
+        self.leaf_outputs = nn.Parameter(torch.empty(n_trees, self.n_leaves, output_dim))
+
+        self.gate_proj = nn.Linear(input_dim, n_trees)
+        self.node_temperature_logits = nn.Parameter(torch.zeros(n_trees, tree_depth))
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        _init_forest_params(self.decision_weights, self.leaf_outputs)
+
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.hard_routing = False
+        self.hard_routing_k = 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+
+        B, S, D = x.shape
+        C = self.chunk_size
+
+        # Pad sequence to multiple of chunk_size
+        pad = (C - S % C) % C
+        if pad > 0:
+            x_padded = F.pad(x, (0, 0, 0, pad))
+        else:
+            x_padded = x
+        S_padded = x_padded.shape[1]
+        n_chunks = S_padded // C
+
+        # Compute causal chunk means for routing (no future leakage)
+        chunks = x_padded.reshape(B, n_chunks, C, D)
+        cumsum = chunks.cumsum(dim=2)
+        counts = torch.arange(1, C + 1, device=x.device, dtype=x.dtype).reshape(1, 1, C, 1)
+        causal_means = cumsum / counts  # Each position only sees past within chunk
+        chunk_context = causal_means.reshape(B, S_padded, D)
+
+        # Route on per-token causal chunk context
+        decisions = torch.einsum('bsd,tnd->bstn', chunk_context, self.decision_weights)
+        decisions = decisions + self.decision_biases
+
+        node_temps = self.temperature * F.softplus(self.node_temperature_logits + 0.5413)
+        decisions = torch.sigmoid(decisions / node_temps)
+
+        self._cached_decisions = decisions[:, :S]
+
+        leaf_probs = _compute_oblivious_leaf_probs(decisions)
+
+        if self.hard_routing:
+            topk_vals, topk_idx = leaf_probs.topk(self.hard_routing_k, dim=-1)
+            hard_probs = torch.zeros_like(leaf_probs)
+            hard_probs.scatter_(-1, topk_idx, topk_vals)
+            leaf_probs = hard_probs / (hard_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        self._cached_leaf_probs = leaf_probs[:, :S]
+
+        # Per-token leaf outputs and gating (still on original x_padded)
+        per_tree = torch.einsum('bstl,tlo->bsto', leaf_probs, self.leaf_outputs)
+        weights = F.softmax(self.gate_proj(x_padded), dim=-1)
+        output = torch.einsum('bsto,bst->bso', per_tree, weights)
+
+        # Remove padding
+        output = output[:, :S]
+
+        if squeeze:
+            output = output.squeeze(1)
+        return self.norm(output)
+
+
+class LinearPlusChunkedRouting(nn.Module):
+    """Linear base + chunked routing forest correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, n_trees: int = 24,
+                 tree_depth: int = 3, chunk_size: int = 16,
+                 temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.forest = ChunkedRoutingForest(input_dim, output_dim, n_trees,
+                                            tree_depth, chunk_size, temperature,
+                                            use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.forest(x))
+
+
+class ProductKeyProjection(nn.Module):
+    """
+    Product-key memory projection: hash-based leaf selection.
+
+    Splits input into two halves, each selects top-k from a codebook.
+    Product of selections gives k² leaf candidates from C² possible leaves.
+    O(sqrt(n_leaves)) routing cost instead of O(n_leaves).
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, codebook_size: int = 16,
+                 top_k: int = 4, temperature: float = 1.0, use_norm: bool = True):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.top_k = top_k
+        self.n_leaves = codebook_size * codebook_size  # C²
+        self.register_buffer('temperature', torch.tensor(float(temperature)))
+
+        half_dim = input_dim // 2
+        self.other_half = input_dim - half_dim  # handle odd dims
+
+        # Two codebooks for the two halves
+        self.codebook_1 = nn.Parameter(torch.randn(codebook_size, half_dim) * 0.1)
+        self.codebook_2 = nn.Parameter(torch.randn(codebook_size, self.other_half) * 0.1)
+
+        # Leaf outputs: (C², output_dim) — one output per product-key combination
+        self.leaf_outputs = nn.Parameter(torch.empty(self.n_leaves, output_dim))
+        nn.init.xavier_normal_(self.leaf_outputs)
+
+        self.norm = nn.LayerNorm(output_dim) if use_norm else nn.Identity()
+
+        # For compatibility
+        self._cached_decisions = None
+        self._cached_leaf_probs = None
+        self.depth = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
+
+        B, S, D = x.shape
+        half = D // 2
+
+        # Split input into two halves
+        x1 = x[..., :half]        # (B, S, half)
+        x2 = x[..., half:]        # (B, S, other_half)
+
+        # Compute scores against each codebook
+        scores_1 = torch.matmul(x1, self.codebook_1.T) / self.temperature  # (B, S, C)
+        scores_2 = torch.matmul(x2, self.codebook_2.T) / self.temperature  # (B, S, C)
+
+        # Soft selection (softmax over codebook entries)
+        weights_1 = F.softmax(scores_1, dim=-1)  # (B, S, C)
+        weights_2 = F.softmax(scores_2, dim=-1)  # (B, S, C)
+
+        # Product gives joint distribution over C² leaves
+        # (B, S, C, 1) * (B, S, 1, C) -> (B, S, C, C) -> (B, S, C²)
+        joint_weights = (weights_1.unsqueeze(-1) * weights_2.unsqueeze(-2)).reshape(B, S, -1)
+
+        # Weighted sum of leaf outputs
+        output = torch.matmul(joint_weights, self.leaf_outputs)  # (B, S, output_dim)
+
+        if squeeze:
+            output = output.squeeze(1)
+        return self.norm(output)
+
+
+class LinearPlusProductKey(nn.Module):
+    """Linear base + product-key memory correction."""
+
+    def __init__(self, input_dim: int, output_dim: int, codebook_size: int = 16,
+                 top_k: int = 4, temperature: float = 1.0):
+        super().__init__()
+        self.base_proj = nn.Linear(input_dim, output_dim)
+        self.pkm = ProductKeyProjection(input_dim, output_dim, codebook_size,
+                                         top_k, temperature, use_norm=False)
+        self.shrinkage = nn.Parameter(torch.tensor(0.1))
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.base_proj(x) + self.shrinkage * self.pkm(x))
 
 
 # =============================================================================
@@ -487,8 +1195,10 @@ class SharedRoutingObliviousForest(nn.Module):
 def make_projection(input_dim: int, output_dim: int, proj_type: str = "batched",
                     n_trees: int = 12, tree_depth: int = 3, temperature: float = 1.0,
                     boosted_trees: int = 24, boosted_depth: int = 3,
+                    leaf_rank: int = 8, ema_decay: float = 0.9,
                     **kwargs) -> nn.Module:
-    """Create a projection layer: 'linear', 'batched', 'boosted', 'oblivious', or 'oblivious_boosted'."""
+    """Create a projection layer: 'linear', 'batched', 'boosted', 'oblivious',
+    'oblivious_boosted', 'micro_tree', 'micro_boosted', 'contextual', or 'contextual_boosted'."""
     if proj_type == "linear":
         return nn.Linear(input_dim, output_dim)
     elif proj_type == "batched":
@@ -503,6 +1213,70 @@ def make_projection(input_dim: int, output_dim: int, proj_type: str = "batched",
     elif proj_type == "oblivious_boosted":
         return ObliviousLinearPlusForest(input_dim, output_dim, boosted_trees,
                                          boosted_depth, temperature)
+    elif proj_type == "micro_tree":
+        return MicroTreeForest(input_dim, output_dim, n_trees, tree_depth,
+                               leaf_rank, temperature, use_norm=False)
+    elif proj_type == "micro_boosted":
+        return LinearPlusMicroTree(input_dim, output_dim, n_trees, tree_depth,
+                                    leaf_rank, temperature)
+    elif proj_type == "contextual":
+        return ContextualRoutingForest(input_dim, output_dim, n_trees, tree_depth,
+                                        temperature, ema_decay=ema_decay,
+                                        use_norm=False)
+    elif proj_type == "contextual_boosted":
+        return LinearPlusContextual(input_dim, output_dim, boosted_trees,
+                                     boosted_depth, temperature,
+                                     ema_decay=ema_decay)
+    elif proj_type == "gated":
+        return GatedProjection(input_dim, output_dim, n_gates=kwargs.get('n_gates', 1),
+                               temperature=temperature, use_norm=False)
+    elif proj_type == "gated_boosted":
+        return LinearPlusGated(input_dim, output_dim, n_gates=kwargs.get('n_gates', 1),
+                               temperature=temperature)
+    elif proj_type == "dynamic":
+        return DynamicLinear(input_dim, output_dim, rank=kwargs.get('leaf_rank', 8),
+                             n_modulations=kwargs.get('n_modulations', 1),
+                             temperature=temperature, use_norm=False)
+    elif proj_type == "dynamic_boosted":
+        return DynamicLinear(input_dim, output_dim, rank=kwargs.get('leaf_rank', 8),
+                             n_modulations=kwargs.get('n_modulations', 4),
+                             temperature=temperature)
+    elif proj_type == "lowrank_routing":
+        return LowRankRoutingForest(input_dim, output_dim, n_trees, tree_depth,
+                                     routing_rank=kwargs.get('routing_rank', 16),
+                                     temperature=temperature, use_norm=False)
+    elif proj_type == "lowrank_boosted":
+        return LinearPlusLowRankRouting(input_dim, output_dim, boosted_trees,
+                                         boosted_depth,
+                                         routing_rank=kwargs.get('routing_rank', 16),
+                                         temperature=temperature)
+    elif proj_type == "recursive":
+        return RecursiveProjection(input_dim, output_dim,
+                                    n_iterations=kwargs.get('n_iterations', 3),
+                                    temperature=temperature, use_norm=False)
+    elif proj_type == "recursive_boosted":
+        return LinearPlusRecursive(input_dim, output_dim,
+                                    n_iterations=kwargs.get('n_iterations', 3),
+                                    temperature=temperature)
+    elif proj_type == "chunked":
+        return ChunkedRoutingForest(input_dim, output_dim, n_trees, tree_depth,
+                                     chunk_size=kwargs.get('chunk_size', 16),
+                                     temperature=temperature, use_norm=False)
+    elif proj_type == "chunked_boosted":
+        return LinearPlusChunkedRouting(input_dim, output_dim, boosted_trees,
+                                         boosted_depth,
+                                         chunk_size=kwargs.get('chunk_size', 16),
+                                         temperature=temperature)
+    elif proj_type == "product_key":
+        return ProductKeyProjection(input_dim, output_dim,
+                                     codebook_size=kwargs.get('codebook_size', 16),
+                                     top_k=kwargs.get('top_k', 4),
+                                     temperature=temperature, use_norm=False)
+    elif proj_type == "product_key_boosted":
+        return LinearPlusProductKey(input_dim, output_dim,
+                                     codebook_size=kwargs.get('codebook_size', 16),
+                                     top_k=kwargs.get('top_k', 4),
+                                     temperature=temperature)
     elif proj_type == "moe":
         return FlatMoEProjection(input_dim, output_dim, n_experts=8,
                                  n_groups=n_trees, temperature=temperature,
@@ -774,10 +1548,15 @@ class TreeTransformer(nn.Module):
 # =============================================================================
 
 _TREE_MODULES = (BatchedTreeForest, ObliviousTreeForest, FlatMoEProjection,
-                 SharedRoutingBatchedForest, SharedRoutingObliviousForest)
+                 SharedRoutingBatchedForest, SharedRoutingObliviousForest,
+                 MicroTreeForest, ContextualRoutingForest,
+                 GatedProjection, DynamicLinear, LowRankRoutingForest,
+                 RecursiveProjection, ChunkedRoutingForest, ProductKeyProjection)
 
 # Oblivious-style modules have (B,S,T,depth) decisions; batched have (B,S,T,n_internal)
-_OBLIVIOUS_MODULES = (ObliviousTreeForest, SharedRoutingObliviousForest)
+_OBLIVIOUS_MODULES = (ObliviousTreeForest, SharedRoutingObliviousForest,
+                      MicroTreeForest, ContextualRoutingForest,
+                      LowRankRoutingForest, ChunkedRoutingForest)
 _BATCHED_MODULES = (BatchedTreeForest, SharedRoutingBatchedForest)
 
 
@@ -866,11 +1645,13 @@ def make_optimizer(model, lr=3e-4, weight_decay=0.01):
     # Routing params (3x LR, no weight decay): decision weights, biases, temperatures,
     # and MoE gate weights (analogous to routing)
     _ROUTING_KEYS = ('decision_weights', 'decision_biases', 'node_temperature',
-                     'moe.gate.weight', 'moe.gate.bias')
+                     'moe.gate.weight', 'moe.gate.bias',
+                     'route_down', 'codebook_1', 'codebook_2')
     # Leaf/expert output params (standard LR, standard weight decay)
-    _LEAF_KEYS = ('leaf_outputs', 'expert_outputs', 'shrinkage')
+    _LEAF_KEYS = ('leaf_outputs', 'leaf_down', 'leaf_up', 'expert_outputs', 'shrinkage',
+                  'up_projs', 'W_left', 'W_right')
     # Gate params (standard LR)
-    _GATE_KEYS = ('gate_proj', 'group_gate')
+    _GATE_KEYS = ('gate_proj', 'group_gate', 'context_proj')
 
     decision_params, leaf_params, gate_params, other_params = [], [], [], []
     for name, param in model.named_parameters():
@@ -892,13 +1673,44 @@ def make_optimizer(model, lr=3e-4, weight_decay=0.01):
 
 
 def count_parameters(model):
-    _TREE_KEYS = ('decision', 'leaf', 'tree_weights', 'shrinkage', 'gate_proj',
-                  'node_temperature', 'expert_outputs', 'group_gate',
-                  'qkv_forest', 'qkv_bases', 'qkv_shrinkage', 'qkv_norms')
+    _TREE_KEYS = ('decision', 'leaf', 'leaf_down', 'leaf_up', 'tree_weights',
+                  'shrinkage', 'gate_proj', 'node_temperature', 'expert_outputs',
+                  'group_gate', 'context_proj', 'ema_decay',
+                  'qkv_forest', 'qkv_bases', 'qkv_shrinkage', 'qkv_norms',
+                  'route_down', 'codebook_1', 'codebook_2', 'down_projs',
+                  'up_projs', 'mod_gate', 'W_left', 'W_right')
     total = sum(p.numel() for p in model.parameters())
     tree_p = sum(p.numel() for n, p in model.named_parameters()
                  if any(k in n for k in _TREE_KEYS))
     return {'total': total, 'tree': tree_p, 'tree_pct': tree_p / total * 100 if total > 0 else 0}
+
+
+# =============================================================================
+# 7b. ADAPTER UTILITIES
+# =============================================================================
+
+def freeze_non_tree_params(model):
+    """Freeze all parameters except tree-specific ones. For adapter fine-tuning."""
+    _TREE_PARAM_KEYS = ('decision', 'leaf', 'shrinkage', 'gate_proj', 'node_temperature')
+    for name, param in model.named_parameters():
+        if any(k in name for k in _TREE_PARAM_KEYS):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+
+def unfreeze_all_params(model):
+    """Unfreeze all parameters."""
+    for param in model.parameters():
+        param.requires_grad = True
+
+
+def set_hard_routing(model, enabled=True, top_k=2):
+    """Enable/disable hard routing on all tree modules."""
+    for module in model.modules():
+        if isinstance(module, _TREE_MODULES) and hasattr(module, 'hard_routing'):
+            module.hard_routing = enabled
+            module.hard_routing_k = top_k
 
 
 # =============================================================================

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from main import (
     TreeTransformer, tree_regularization_loss, leaf_balancing_loss,
     count_parameters, set_temperature, get_routing_entropy, make_optimizer,
+    freeze_non_tree_params, unfreeze_all_params, set_hard_routing,
 )
 from data import ShakespeareDataset
 
@@ -186,6 +187,95 @@ MODEL_CONFIGS = {
         "proj_type": "oblivious_boosted", "use_tree_ffn": False,
         "boosted_trees": 24, "boosted_depth": 3,
         "shared_routing": True,
+    },
+    # --- Micro-tree variants (NEW-01) ---
+    "micro_tree": {
+        "description": "Micro-Tree Forest (attn only)",
+        "proj_type": "micro_tree", "use_tree_ffn": False,
+        "n_trees": 4, "tree_depth": 1, "leaf_rank": 8,
+    },
+    "micro_boosted": {
+        "description": "Linear+MicroTree (attn only)",
+        "proj_type": "micro_boosted", "use_tree_ffn": False,
+        "n_trees": 4, "tree_depth": 1, "leaf_rank": 8,
+    },
+    "micro_boosted_d2": {
+        "description": "Linear+MicroTree depth-2 (attn only)",
+        "proj_type": "micro_boosted", "use_tree_ffn": False,
+        "n_trees": 4, "tree_depth": 2, "leaf_rank": 8,
+    },
+    # --- Contextual routing variants (NEW-05) ---
+    "contextual": {
+        "description": "Contextual Routing Forest (attn only)",
+        "proj_type": "contextual", "use_tree_ffn": False,
+        "n_trees": 12, "tree_depth": 3, "ema_decay": 0.9,
+    },
+    "contextual_boosted": {
+        "description": "Linear+Contextual (attn only)",
+        "proj_type": "contextual_boosted", "use_tree_ffn": False,
+        "boosted_trees": 24, "boosted_depth": 3, "ema_decay": 0.9,
+    },
+    # --- Depth ablation variants (NEW-06) ---
+    "oblivious_boosted_d1": {
+        "description": "Oblivious L+F depth-1 (24 trees, 48 leaves)",
+        "proj_type": "oblivious_boosted", "use_tree_ffn": False,
+        "boosted_trees": 24, "boosted_depth": 1,
+    },
+    "oblivious_boosted_d2": {
+        "description": "Oblivious L+F depth-2 (12 trees, 48 leaves)",
+        "proj_type": "oblivious_boosted", "use_tree_ffn": False,
+        "boosted_trees": 12, "boosted_depth": 2,
+    },
+    "oblivious_boosted_d4": {
+        "description": "Oblivious L+F depth-4 (3 trees, 48 leaves)",
+        "proj_type": "oblivious_boosted", "use_tree_ffn": False,
+        "boosted_trees": 3, "boosted_depth": 4,
+    },
+    # --- Speed-optimized projections ---
+    "gated_boosted": {
+        "description": "Linear+Gated (GLU-style)",
+        "proj_type": "gated_boosted", "use_tree_ffn": False,
+        "n_gates": 1,
+    },
+    "gated_boosted_d2": {
+        "description": "Linear+Gated depth-2 (2 gates)",
+        "proj_type": "gated_boosted", "use_tree_ffn": False,
+        "n_gates": 2,
+    },
+    "dynamic": {
+        "description": "Dynamic Linear (rank-8, 1 mod)",
+        "proj_type": "dynamic", "use_tree_ffn": False,
+        "leaf_rank": 8,
+        "n_modulations": 1,
+    },
+    "dynamic_boosted": {
+        "description": "Dynamic Linear (rank-8, 4 mods)",
+        "proj_type": "dynamic_boosted", "use_tree_ffn": False,
+        "leaf_rank": 8,
+        "n_modulations": 4,
+    },
+    "lowrank_boosted": {
+        "description": "Linear+LowRankRouting (r=16)",
+        "proj_type": "lowrank_boosted", "use_tree_ffn": False,
+        "boosted_trees": 24, "boosted_depth": 3,
+        "routing_rank": 16,
+    },
+    "recursive_boosted": {
+        "description": "Linear+Recursive (3 iterations)",
+        "proj_type": "recursive_boosted", "use_tree_ffn": False,
+        "n_iterations": 3,
+    },
+    "chunked_boosted": {
+        "description": "Linear+ChunkedRouting (chunk=16)",
+        "proj_type": "chunked_boosted", "use_tree_ffn": False,
+        "boosted_trees": 24, "boosted_depth": 3,
+        "chunk_size": 16,
+    },
+    "product_key_boosted": {
+        "description": "Linear+ProductKey (C=16)",
+        "proj_type": "product_key_boosted", "use_tree_ffn": False,
+        "codebook_size": 16,
+        "top_k": 4,
     },
 }
 
